@@ -27,7 +27,7 @@ public:
   float longitude;
   bool descent = false;
 
-  const float P_ground_ref = 1015.0f;
+  const float P_ground_ref = 1007.56f;
   float currentHeightAG;
 
   static const int N_SAMPLES = 5;
