@@ -27,7 +27,7 @@ public:
   float longitude;
   bool descent = false;
 
-  const float P_ground_ref = 1007.56f;
+  const float P_ground_ref = 1004.56f;
   float currentHeightAG;
 
   static const int N_SAMPLES = 5;
@@ -130,8 +130,8 @@ public:
     logFile.print(temperatureOut, 2); logFile.print(',');
     logFile.print(pressure, 2);       logFile.print(',');
     logFile.print(latitude, 6);       logFile.print(',');
-    logFile.println(longitude, 6);    logFile.print(',');
-    logFile.println(currentHeightAG, 3);    logFile.print(',');
+    logFile.print(longitude, 6);    logFile.print(',');
+    logFile.print(currentHeightAG, 3);    logFile.print(',');
     logFile.println(descent);
     
 
@@ -229,7 +229,7 @@ void setup() {
   }
 
   if (logFile.size() == 0) {
-    logFile.println("timestamp_ms,temperatureIn,temperatureOut,pressure,latitude,longitude");
+    logFile.println("timestamp_ms,temperatureIn,temperatureOut,pressure,latitude,longitude,altitude_AGL,descent");
     logFile.flush();
   }
 
