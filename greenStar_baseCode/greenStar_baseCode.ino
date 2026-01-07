@@ -41,6 +41,17 @@ private:
   char nmeaBuf[NMEA_BUF_SIZE];
   int  nmeaLen;
 
+  // ===================== ADDED: RADIO =====================
+  Radio radio = Radio(Pins::Radio::ChipSelect,
+                      Pins::Radio::DIO0,
+                      433.0,
+                      Bandwidth_125000_Hz,
+                      SpreadingFactor_9,
+                      CodingRate_4_8);
+
+  Frame frame;
+  // =======================================================
+
 public:
   GreenStar() {
     nmeaLen = 0;
@@ -56,6 +67,12 @@ public:
     sensors.begin();
     bmp.setOversampling(16);
   }
+
+  // ===================== ADDED: RADIO INIT =====================
+  void initializeRadio() {
+    radio.begin();
+  }
+  // =============================================================
 
   void readTemperatureOut() {
     sensors.requestTemperatures();
@@ -133,7 +150,6 @@ public:
     logFile.print(longitude, 6);    logFile.print(',');
     logFile.print(currentHeightAG, 3);    logFile.print(',');
     logFile.println(descent);
-    
 
     logFile.flush();
 
@@ -168,6 +184,27 @@ public:
 
     SerialUSB.println("Logged data to SD");
   }
+
+  // ===================== ADDED: RADIO BUNDLE SEND =====================
+  void sendRadioBundle() {
+    // Build a compact CSV-like payload:
+    // temperatureIn,temperatureOut,pressure,latitude,longitude,descent
+    frame.print(temperatureIn, 2);  frame.print(',');
+    frame.print(temperatureOut, 2); frame.print(',');
+    frame.print(pressure, 2);       frame.print(',');
+    frame.print(latitude, 6);       frame.print(',');
+    frame.print(longitude, 6);      frame.print(',');
+    frame.print(descent ? 1 : 0);
+
+    radio.transmit(frame);
+
+    // Debug print (optional but matches example behavior)
+    SerialUSB.print("RADIO TX: ");
+    SerialUSB.println(frame);
+
+    frame.clear();
+  }
+  // ====================================================================
 
 private:
   void processNMEALine(const char *line) {
@@ -239,6 +276,11 @@ void setup() {
   }
 
   cansat.initializeSensors();
+
+  // ===================== ADDED: RADIO INIT CALL =====================
+  cansat.initializeRadio();
+  // ================================================================
+
   SerialUSB.println("Setup done, logging started.");
 }
 
@@ -249,5 +291,10 @@ void loop() {
   cansat.updateAltitudeSampleAndCheckDescent();
   cansat.readGPS();
   cansat.logData();
+
+  // ===================== ADDED: RADIO SEND CALL =====================
+  cansat.sendRadioBundle();
+  // ================================================================
+
   delay(1000);
 }
