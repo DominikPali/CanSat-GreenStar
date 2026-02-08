@@ -1,64 +1,38 @@
-#include <SPI.h>
-#include <RadioLib.h>
+#include <CanSatKit.h>
 
-// === CONFIGURE PINS FOR YOUR LORA MODULE ===
-// Example for SX1278 / RFM95 style
-#define LORA_CS    10   // LoRa chip select
-#define LORA_DIO0   2   // LoRa interrupt
-#define LORA_RST    9   // LoRa reset
+using namespace CanSatKit;
 
-SX1278 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST);
+// set radio receiver parameters - see comments below
+// remember to set the same radio parameters in
+// transmitter and receiver boards!
+Radio radio(Pins::Radio::ChipSelect,
+            Pins::Radio::DIO0,
+            433.0,                  // frequency in MHz
+            Bandwidth_125000_Hz,    // bandwidth - check with CanSat regulations to set allowed value
+            SpreadingFactor_9,      // see provided presentations to determine which setting is the best
+            CodingRate_4_8);        // see provided presentations to determine which setting is the best
 
 void setup() {
   SerialUSB.begin(115200);
-  while (!SerialUSB) delay(10);
 
-  SerialUSB.println("Serial ready, initializing LoRa...");
-
-  // begin with freq 433MHz, BW=125kHz, SF=9, CR=4/8
-  int state = radio.begin(433.0, 125.0, 9, 7, RADIOLIB_SX127X_SYNC_WORD, 10);
-  if (state != RADIOLIB_ERR_NONE) {
-    SerialUSB.print("Radio init failed, code ");
-    SerialUSB.println(state);
-    while (true) delay(100);
-  }
-
-  SerialUSB.println("LoRa receiver initialized.");
+  // start radio module  
+  radio.begin();
 }
 
 void loop() {
-  String packet;
+  // prepare empty space for received frame
+  // maximum length is maximum frame length + null termination
+  // 255 + 1 byte = 256 bytes
+  char data[256];
+
+  // receive data and save it to string
+  radio.receive(data);
   
-  // Try to receive (blocking)
-  int state = radio.receive(packet);
+  // get and print signal level (rssi)
+  SerialUSB.print("Received (RSSI = ");
+  SerialUSB.print(radio.get_rssi_last());
+  SerialUSB.print("): ");
 
-  if (state == RADIOLIB_ERR_NONE) {
-    SerialUSB.println("=== PACKET RECEIVED ===");
-    SerialUSB.print("Data: ");
-    SerialUSB.println(packet);
-
-    SerialUSB.print("RSSI: ");
-    SerialUSB.print(radio.getRSSI());
-    SerialUSB.println(" dBm");
-
-    SerialUSB.print("SNR: ");
-    SerialUSB.print(radio.getSNR());
-    SerialUSB.println(" dB");
-
-    SerialUSB.println("------------------------");
-  }
-  else if (state == RADIOLIB_ERR_RX_TIMEOUT) {
-    // No packet received within timeout
-    // You can comment this out if it clutters Serial
-    SerialUSB.println("RX timeout (no packet)");
-  }
-  else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
-    SerialUSB.println("CRC error (bad packet)");
-  }
-  else {
-    SerialUSB.print("Receive failed, code ");
-    SerialUSB.println(state);
-  }
-
-  delay(100); 
+  // print received message
+  SerialUSB.println(data);
 }
