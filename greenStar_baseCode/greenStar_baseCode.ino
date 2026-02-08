@@ -197,6 +197,7 @@ void sendRadioBundle() {
     frame.print(pressure, 2);       frame.print(',');
     frame.print(latitude, 6);       frame.print(',');
     frame.print(longitude, 6);      frame.print(',');
+    frame.print(currentHeightAG, 3); frame.print(',');
     frame.print(descent ? 1 : 0);
 
     radio.transmit(frame);
