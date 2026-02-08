@@ -186,10 +186,13 @@ public:
   }
 
   // ===================== ADDED: RADIO BUNDLE SEND =====================
-  void sendRadioBundle() {
+void sendRadioBundle() {
+    unsigned long ms = millis();  // get milliseconds since start
+
     // Build a compact CSV-like payload:
-    // temperatureIn,temperatureOut,pressure,latitude,longitude,descent
-    frame.print(temperatureIn, 2);  frame.print(',');
+    // timestamp_ms,temperatureIn,temperatureOut,pressure,latitude,longitude,descent
+    frame.print(ms);               frame.print(',');
+    frame.print(temperatureIn, 2); frame.print(',');
     frame.print(temperatureOut, 2); frame.print(',');
     frame.print(pressure, 2);       frame.print(',');
     frame.print(latitude, 6);       frame.print(',');
@@ -198,12 +201,13 @@ public:
 
     radio.transmit(frame);
 
-    // Debug print (optional but matches example behavior)
+    // Debug print
     SerialUSB.print("RADIO TX: ");
     SerialUSB.println(frame);
 
     frame.clear();
-  }
+}
+
   // ====================================================================
 
 private:
