@@ -9,6 +9,11 @@
 #define ONE_WIRE_BUS 2
 #define GPS_SERIAL Serial
 
+// RGB LED pins (common anode - LOW = ON, HIGH = OFF)
+#define LED_R 1
+#define LED_G 3
+#define LED_B 5
+
 using namespace CanSatKit;
 
 BMP280 bmp;
@@ -17,6 +22,13 @@ DallasTemperature sensors(&oneWire);
 
 const int chipSelect = 11;
 File logFile;
+
+// LED helper: common anode - LOW activates color
+void setLED(bool r, bool g, bool b) {
+  digitalWrite(LED_R, r ? LOW : HIGH);
+  digitalWrite(LED_G, g ? LOW : HIGH);
+  digitalWrite(LED_B, b ? LOW : HIGH);
+}
 
 class GreenStar {
 public:
@@ -186,24 +198,29 @@ public:
   }
 
   // ===================== ADDED: RADIO BUNDLE SEND =====================
-  void sendRadioBundle() {
+void sendRadioBundle() {
+    unsigned long ms = millis();  // get milliseconds since start
+
     // Build a compact CSV-like payload:
-    // temperatureIn,temperatureOut,pressure,latitude,longitude,descent
-    frame.print(temperatureIn, 2);  frame.print(',');
+    // timestamp_ms,temperatureIn,temperatureOut,pressure,latitude,longitude,descent
+    frame.print(ms);               frame.print(',');
+    frame.print(temperatureIn, 2); frame.print(',');
     frame.print(temperatureOut, 2); frame.print(',');
     frame.print(pressure, 2);       frame.print(',');
     frame.print(latitude, 6);       frame.print(',');
     frame.print(longitude, 6);      frame.print(',');
+    frame.print(currentHeightAG, 3); frame.print(',');
     frame.print(descent ? 1 : 0);
 
     radio.transmit(frame);
 
-    // Debug print (optional but matches example behavior)
+    // Debug print
     SerialUSB.print("RADIO TX: ");
     SerialUSB.println(frame);
 
     frame.clear();
-  }
+}
+
   // ====================================================================
 
 private:
@@ -250,8 +267,19 @@ private:
 GreenStar cansat;
 
 void setup() {
+  // Initialize LED pins
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  setLED(false, false, false); // off
+
   SerialUSB.begin(9600);
   GPS_SERIAL.begin(9600);
+
+  // RED (2s) - Arduino is powered
+  setLED(true, false, false);
+  delay(2000);
+  setLED(false, false, false);
 
   pinMode(chipSelect, OUTPUT);
   if (!SD.begin(chipSelect)) {
@@ -277,9 +305,24 @@ void setup() {
 
   cansat.initializeSensors();
 
+  // YELLOW (2s) - pressure and temperature sensors working properly
+  cansat.readTemperatureInAndPressure();
+  bool sensorsOk = (cansat.pressure >= 300.0 && cansat.pressure <= 1100.0) &&
+                   (cansat.temperatureIn >= -40.0 && cansat.temperatureIn <= 85.0);
+  if (sensorsOk) {
+    setLED(true, true, false); // YELLOW = R+G
+    delay(2000);
+    setLED(false, false, false);
+  }
+
   // ===================== ADDED: RADIO INIT CALL =====================
   cansat.initializeRadio();
   // ================================================================
+
+  // BLUE (2s) - radio initialized and working
+  setLED(false, false, true); // BLUE
+  delay(2000);
+  setLED(false, false, false);
 
   SerialUSB.println("Setup done, logging started.");
 }
@@ -296,5 +339,17 @@ void loop() {
   cansat.sendRadioBundle();
   // ================================================================
 
-  delay(1000);
+  // LED status indication
+  bool gpsFixed = !(cansat.latitude == 0.0f && cansat.longitude == 0.0f);
+  if (!gpsFixed) {
+    // PURPLE blinking - waiting for GPS fix
+    setLED(true, false, true); // PURPLE = R+B
+    delay(500);
+    setLED(false, false, false);
+    delay(500);
+  } else {
+    // GREEN constant - all systems working
+    setLED(false, true, false);
+    delay(1000);
+  }
 }
