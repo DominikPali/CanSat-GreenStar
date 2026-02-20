@@ -339,17 +339,5 @@ void loop() {
   cansat.sendRadioBundle();
   // ================================================================
 
-  // LED status indication
-  bool gpsFixed = !(cansat.latitude == 0.0f && cansat.longitude == 0.0f);
-  if (!gpsFixed) {
-    // PURPLE blinking - waiting for GPS fix
-    setLED(true, false, true); // PURPLE = R+B
-    delay(500);
-    setLED(false, false, false);
-    delay(500);
-  } else {
-    // GREEN constant - all systems working
-    setLED(false, true, false);
-    delay(1000);
-  }
+  delay(1000);
 }
