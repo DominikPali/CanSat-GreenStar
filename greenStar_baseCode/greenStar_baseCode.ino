@@ -38,6 +38,15 @@ int servoSweepDuration = 2000; // duration of 0° -> 180° sweep in ms (modifiab
 // Test mode: if true, servo activates 10s after boot
 bool test = true;
 
+// Non-blocking loop timing
+unsigned long previousLoopTime = 0;
+const unsigned long loopInterval = 1000; // 1 second between sensor reads
+
+// Non-blocking LED blink state
+bool ledBlinkOn = false;
+unsigned long previousBlinkTime = 0;
+const unsigned long blinkInterval = 500; // 500ms on / 500ms off
+
 // LED helper: common anode - LOW activates color
 void setLED(bool r, bool g, bool b) {
   digitalWrite(LED_R, r ? LOW : HIGH);
@@ -59,16 +68,14 @@ public:
 
   static const int N_SAMPLES = 5;
   float alt_buffer[N_SAMPLES];
-  int buf_index = 0;      // next position to write
+  int buf_index = 0;
   bool buffer_full = false;
 
 private:
-  // NMEA buffer
   static const int NMEA_BUF_SIZE = 120;
   char nmeaBuf[NMEA_BUF_SIZE];
   int  nmeaLen;
 
-  // ===================== ADDED: RADIO =====================
   Radio radio = Radio(Pins::Radio::ChipSelect,
                       Pins::Radio::DIO0,
                       433.0,
@@ -77,14 +84,12 @@ private:
                       CodingRate_4_8);
 
   Frame frame;
-  // =======================================================
 
 public:
   GreenStar() {
     nmeaLen = 0;
     latitude = 0.0f;
     longitude = 0.0f;
-    // initialize buffer (optional)
     for (int i = 0; i < N_SAMPLES; i++) {
       alt_buffer[i] = 0.0f;
     }
@@ -95,11 +100,9 @@ public:
     bmp.setOversampling(16);
   }
 
-  // ===================== ADDED: RADIO INIT =====================
   void initializeRadio() {
     radio.begin();
   }
-  // =============================================================
 
   void readTemperatureOut() {
     sensors.requestTemperatures();
@@ -111,13 +114,10 @@ public:
   }
 
   void altitude_from_pressure() {
-    // barometric formula: h = 44330 * (1 - (pressure / P0)^(0.1903))
     currentHeightAG = 44330.0f * (1.0f - powf(pressure / P_ground_ref, 0.1903f));
   }
 
-  // Call this every second (just after updating currentHeightAG)
   void updateAltitudeSampleAndCheckDescent() {
-    // store current height in buffer
     alt_buffer[buf_index] = currentHeightAG;
     buf_index++;
     if (buf_index >= N_SAMPLES) {
@@ -126,11 +126,8 @@ public:
     }
 
     if (buffer_full) {
-      // check if strictly decreasing
       bool all_decreasing = true;
-      // we need to check samples in time order: oldest → newest
-      // compute start index of the oldest sample
-      int start = buf_index;  // next write pos is oldest (oldest was overwritten), so buffer content is from start
+      int start = buf_index;
       for (int i = 1; i < N_SAMPLES; i++) {
         int idx_prev = (start + i - 1) % N_SAMPLES;
         int idx_cur  = (start + i) % N_SAMPLES;
@@ -157,7 +154,6 @@ public:
         if (nmeaLen < NMEA_BUF_SIZE - 1) {
           nmeaBuf[nmeaLen++] = c;
         } else {
-          // buffer overflow — reset
           nmeaLen = 0;
         }
       }
@@ -169,13 +165,13 @@ public:
 
     unsigned long ms = millis();
 
-    logFile.print(ms);     logFile.print(',');
+    logFile.print(ms);                logFile.print(',');
     logFile.print(temperatureIn, 2);  logFile.print(',');
     logFile.print(temperatureOut, 2); logFile.print(',');
     logFile.print(pressure, 2);       logFile.print(',');
     logFile.print(latitude, 6);       logFile.print(',');
-    logFile.print(longitude, 6);    logFile.print(',');
-    logFile.print(currentHeightAG, 3);    logFile.print(',');
+    logFile.print(longitude, 6);      logFile.print(',');
+    logFile.print(currentHeightAG, 3); logFile.print(',');
     logFile.println(descent);
 
     logFile.flush();
@@ -203,7 +199,7 @@ public:
     SerialUSB.print("Descent: ");
     SerialUSB.println(descent ? "YES" : "NO");
 
-    for(int i = 0; i < N_SAMPLES; i++){
+    for (int i = 0; i < N_SAMPLES; i++) {
       SerialUSB.print(alt_buffer[i], 3);
       SerialUSB.print(" ");
     }
@@ -212,14 +208,11 @@ public:
     SerialUSB.println("Logged data to SD");
   }
 
-  // ===================== ADDED: RADIO BUNDLE SEND =====================
-void sendRadioBundle() {
-    unsigned long ms = millis();  // get milliseconds since start
+  void sendRadioBundle() {
+    unsigned long ms = millis();
 
-    // Build a compact CSV-like payload:
-    // timestamp_ms,temperatureIn,temperatureOut,pressure,latitude,longitude,descent
-    frame.print(ms);               frame.print(',');
-    frame.print(temperatureIn, 2); frame.print(',');
+    frame.print(ms);                frame.print(',');
+    frame.print(temperatureIn, 2);  frame.print(',');
     frame.print(temperatureOut, 2); frame.print(',');
     frame.print(pressure, 2);       frame.print(',');
     frame.print(latitude, 6);       frame.print(',');
@@ -229,14 +222,11 @@ void sendRadioBundle() {
 
     radio.transmit(frame);
 
-    // Debug print
     SerialUSB.print("RADIO TX: ");
     SerialUSB.println(frame);
 
     frame.clear();
-}
-
-  // ====================================================================
+  }
 
 private:
   void processNMEALine(const char *line) {
@@ -247,7 +237,7 @@ private:
 
     char buf[NMEA_BUF_SIZE];
     strncpy(buf, line, NMEA_BUF_SIZE);
-    buf[NMEA_BUF_SIZE-1] = '\0';
+    buf[NMEA_BUF_SIZE - 1] = '\0';
 
     char *fields[20];
     int idx = 0;
@@ -286,7 +276,7 @@ void setup() {
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
-  setLED(false, false, false); // off
+  setLED(false, false, false);
 
   SerialUSB.begin(9600);
   GPS_SERIAL.begin(9600);
@@ -294,7 +284,7 @@ void setup() {
   // Initialize servo to starting position (0 degrees)
   containerServo.attach(SERVO_PIN);
   containerServo.write(0);
-  delay(500); // brief pause to let servo reach 0°
+  delay(500);
 
   // RED (2s) - Arduino is powered
   setLED(true, false, false);
@@ -330,58 +320,64 @@ void setup() {
   bool sensorsOk = (cansat.pressure >= 300.0 && cansat.pressure <= 1100.0) &&
                    (cansat.temperatureIn >= -40.0 && cansat.temperatureIn <= 85.0);
   if (sensorsOk) {
-    setLED(true, true, false); // YELLOW = R+G
+    setLED(true, true, false);
     delay(2000);
     setLED(false, false, false);
   }
 
-  // ===================== ADDED: RADIO INIT CALL =====================
   cansat.initializeRadio();
-  // ================================================================
 
   // BLUE (2s) - radio initialized and working
-  setLED(false, false, true); // BLUE
+  setLED(false, false, true);
   delay(2000);
   setLED(false, false, false);
 
   SerialUSB.println("Setup done, logging started.");
+
+  previousLoopTime = millis();
+  previousBlinkTime = millis();
 }
 
 void loop() {
-  cansat.readTemperatureOut();
-  cansat.readTemperatureInAndPressure();
-  cansat.altitude_from_pressure();
-  cansat.updateAltitudeSampleAndCheckDescent();
-  cansat.readGPS();
-  cansat.logData();
+  unsigned long now = millis();
 
-  // ===================== ADDED: RADIO SEND CALL =====================
-  cansat.sendRadioBundle();
+  // ===================== SENSOR READ EVERY 1s =====================
+  if (now - previousLoopTime >= loopInterval) {
+    previousLoopTime = now;
+
+    cansat.readTemperatureOut();
+    cansat.readTemperatureInAndPressure();
+    cansat.altitude_from_pressure();
+    cansat.updateAltitudeSampleAndCheckDescent();
+    cansat.readGPS();
+    cansat.logData();
+    cansat.sendRadioBundle();
+  }
   // ================================================================
 
-  // ===================== TEST MODE: trigger servo after 10s =====================
-  if (test && !openContainer && millis() >= 10000) {
+  // ===================== TEST MODE =====================
+  if (test && !openContainer && now >= 10000) {
     openContainer = true;
     SerialUSB.println("TEST: triggering servo opening after 10s");
   }
-  // ==============================================================================
+  // =====================================================
 
   // ===================== NON-BLOCKING SERVO SWEEP =====================
-  // Sweeps 0° -> 180° over servoSweepDuration ms.
-  // Each loop tick computes the target angle from elapsed time — no blocking.
   if (openContainer && !servoDone) {
     if (!servoMoving) {
       servoMoving = true;
-      servoStartTime = millis();
+      servoStartTime = now;
     }
 
-    unsigned long elapsed = millis() - servoStartTime;
+    unsigned long elapsed = now - servoStartTime;
 
     if (elapsed >= (unsigned long)servoSweepDuration) {
       containerServo.write(180);
+      delay(300); // brief hold to ensure servo reaches final position
+      containerServo.detach(); // release timer to restore LED PWM
       servoMoving = false;
       servoDone = true;
-      SerialUSB.println("Servo: reached 180°");
+      SerialUSB.println("Servo: reached 180°, detached");
     } else {
       int angle = (int)((float)elapsed / (float)servoSweepDuration * 180.0f);
       containerServo.write(angle);
@@ -389,18 +385,23 @@ void loop() {
   }
   // ====================================================================
 
-  // ===================== LED GPS STATUS =====================
+  // ===================== NON-BLOCKING LED GPS STATUS =====================
   bool gpsFixed = !(cansat.latitude == 0.0f && cansat.longitude == 0.0f);
+
   if (!gpsFixed) {
-    // PURPLE blinking - waiting for GPS fix
-    setLED(true, false, true); // PURPLE = R+B
-    delay(500);
-    setLED(false, false, false);
-    delay(500);
+    // PURPLE blinking — toggle every 500ms
+    if (now - previousBlinkTime >= blinkInterval) {
+      previousBlinkTime = now;
+      ledBlinkOn = !ledBlinkOn;
+    }
+    if (ledBlinkOn) {
+      setLED(true, false, true); // PURPLE = R+B
+    } else {
+      setLED(false, false, false);
+    }
   } else {
-    // GREEN constant - all systems working
+    // GREEN constant — all systems working
     setLED(false, true, false);
-    delay(1000);
   }
-  // ==========================================================
+  // ======================================================================
 }
