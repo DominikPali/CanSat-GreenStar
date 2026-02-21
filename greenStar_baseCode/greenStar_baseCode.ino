@@ -1,5 +1,6 @@
 #include <SPI.h>
 #include <SD.h>
+#include <Servo.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -14,6 +15,9 @@
 #define LED_G 3
 #define LED_B 5
 
+// Servo pin
+#define SERVO_PIN 9
+
 using namespace CanSatKit;
 
 BMP280 bmp;
@@ -22,6 +26,17 @@ DallasTemperature sensors(&oneWire);
 
 const int chipSelect = 11;
 File logFile;
+
+// Servo
+Servo containerServo;
+bool openContainer = false;
+bool servoDone = false;
+bool servoMoving = false;
+unsigned long servoStartTime = 0;
+int servoSweepDuration = 2000; // duration of 0° -> 180° sweep in ms (modifiable)
+
+// Test mode: if true, servo activates 10s after boot
+bool test = true;
 
 // LED helper: common anode - LOW activates color
 void setLED(bool r, bool g, bool b) {
@@ -276,6 +291,11 @@ void setup() {
   SerialUSB.begin(9600);
   GPS_SERIAL.begin(9600);
 
+  // Initialize servo to starting position (0 degrees)
+  containerServo.attach(SERVO_PIN);
+  containerServo.write(0);
+  delay(500); // brief pause to let servo reach 0°
+
   // RED (2s) - Arduino is powered
   setLED(true, false, false);
   delay(2000);
@@ -339,5 +359,48 @@ void loop() {
   cansat.sendRadioBundle();
   // ================================================================
 
-  delay(1000);
+  // ===================== TEST MODE: trigger servo after 10s =====================
+  if (test && !openContainer && millis() >= 10000) {
+    openContainer = true;
+    SerialUSB.println("TEST: triggering servo opening after 10s");
+  }
+  // ==============================================================================
+
+  // ===================== NON-BLOCKING SERVO SWEEP =====================
+  // Sweeps 0° -> 180° over servoSweepDuration ms.
+  // Each loop tick computes the target angle from elapsed time — no blocking.
+  if (openContainer && !servoDone) {
+    if (!servoMoving) {
+      servoMoving = true;
+      servoStartTime = millis();
+    }
+
+    unsigned long elapsed = millis() - servoStartTime;
+
+    if (elapsed >= (unsigned long)servoSweepDuration) {
+      containerServo.write(180);
+      servoMoving = false;
+      servoDone = true;
+      SerialUSB.println("Servo: reached 180°");
+    } else {
+      int angle = (int)((float)elapsed / (float)servoSweepDuration * 180.0f);
+      containerServo.write(angle);
+    }
+  }
+  // ====================================================================
+
+  // ===================== LED GPS STATUS =====================
+  bool gpsFixed = !(cansat.latitude == 0.0f && cansat.longitude == 0.0f);
+  if (!gpsFixed) {
+    // PURPLE blinking - waiting for GPS fix
+    setLED(true, false, true); // PURPLE = R+B
+    delay(500);
+    setLED(false, false, false);
+    delay(500);
+  } else {
+    // GREEN constant - all systems working
+    setLED(false, true, false);
+    delay(1000);
+  }
+  // ==========================================================
 }
