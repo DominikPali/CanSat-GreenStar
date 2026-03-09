@@ -1,224 +1,578 @@
+// ============================================================================
+// GREEN STAR CANSAT - MAIN FLIGHT SOFTWARE
+// ============================================================================
+//
+// Mission: Deploy cellulose seed capsules at ~100m AGL during descent,
+//          while continuously logging and transmitting environmental data.
+//
+// Hardware:
+//   - ATSAMD21G18A microcontroller (CanSat Kit)
+//   - BMP280 pressure/temperature sensor (I2C)
+//   - DS18B20 external temperature sensor (OneWire on pin 2)
+//   - SparkFun SAM-M10Q GPS module (UART on Serial, pins 0/1)
+//   - LoRa SX1278 radio transceiver (SPI)
+//   - SG-90 micro servo motor (PWM on pin 7)
+//   - RGB LED common-anode (pins 4, 6, 8 — LOW = ON)
+//   - MicroSD card (SPI, CS on pin 11)
+//
+// Flight phases:
+//   1. GROUND — sensors initialise, LED sequence confirms health
+//   2. ASCENT (flight_up) — rocket is climbing, altitude increasing
+//   3. DESCENT — CanSat ejected, altitude decreasing at ~expected rate
+//   4. DEPLOY — altitude <= 100 m AGL while descending → servo opens
+//   5. POST-DEPLOY — continue logging/transmitting until recovery
+//
+// Authors : Green Star Team
+// Version : 2.0
+// ============================================================================
+
 #include <SPI.h>
 #include <SD.h>
 #include <Servo.h>
-
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <CanSatKit.h>
 
-// Pin where the DS18B20 data line is connected
+// ============================================================================
+// PIN DEFINITIONS
+// ============================================================================
+
+// DS18B20 external temperature sensor data line
 #define ONE_WIRE_BUS 2
+
+// GPS is connected to the hardware UART (Serial) on the SAMD21.
+// On the CanSat Kit, Serial uses pins 0 (RX) and 1 (TX).
+// IMPORTANT: Do NOT use pins 0 or 1 for anything else (e.g. LEDs).
 #define GPS_SERIAL Serial
 
-// RGB LED pins (common anode - LOW = ON, HIGH = OFF)
-#define LED_R 1
-#define LED_G 3
-#define LED_B 5
+// RGB LED pins — common-anode wiring means LOW turns the colour ON.
+// FIX #15: Moved LED pins away from 1 and 3 to avoid conflict with
+// Serial (pin 0/1) and potential SERCOM issues on pin 3.
+// New pins: 4, 6, 8 — all are safe GPIOs with no UART conflict.
+#define LED_R 4
+#define LED_G 6
+#define LED_B 8
 
-// Servo pin
-#define SERVO_PIN 9
+// Servo motor control pin (PWM-capable)
+#define SERVO_PIN 7
 
+// SD card chip-select pin
+const int chipSelect = 11;
+
+// ============================================================================
+// LIBRARY NAMESPACE
+// ============================================================================
 using namespace CanSatKit;
 
-BMP280 bmp;
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+// ============================================================================
+// GLOBAL SENSOR OBJECTS
+// ============================================================================
 
-const int chipSelect = 11;
+// BMP280 pressure + internal temperature sensor (from CanSatKit library)
+BMP280 bmp;
+
+// DS18B20 external temperature sensor (OneWire protocol)
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature dsSensors(&oneWire);
+
+// SD card log file handle
 File logFile;
 
-// Servo
+// Servo motor object for seed-dispersal mechanism
 Servo containerServo;
-bool openContainer = false;
-bool servoDone = false;
-bool servoMoving = false;
-unsigned long servoStartTime = 0;
-int servoSweepDuration = 2000; // duration of 0° -> 180° sweep in ms (modifiable)
 
-// Test mode: if true, servo activates 10s after boot
+// ============================================================================
+// SERVO STATE MACHINE
+// ============================================================================
+// The servo opens the seed container.  We track its state with booleans
+// so that the opening sequence runs exactly once, non-blocking.
+
+bool openContainer  = false;   // true when deployment conditions are met
+bool servoDone      = false;   // true after servo has finished its sweep
+bool servoMoving    = false;   // true while the servo is actively sweeping
+unsigned long servoStartTime = 0;
+int servoSweepDuration = 2000; // time for 0° → 180° sweep (ms) — tuneable
+
+// ============================================================================
+// TEST MODE
+// ============================================================================
+// When 'test' is true the servo will activate 10 seconds after boot,
+// bypassing the flight-phase checks.  Set to false for actual flight!
+
 bool test = true;
 
-// Non-blocking loop timing
-unsigned long previousLoopTime = 0;
-const unsigned long loopInterval = 1000; // 1 second between sensor reads
+// ============================================================================
+// LOOP TIMING (non-blocking)
+// ============================================================================
 
-// Non-blocking LED blink state
+unsigned long previousLoopTime  = 0;
+
+// FIX #22: Faster sample rate.
+// BMP280 at 16× oversampling takes ~38 ms per measurement.
+// DS18B20 at default 12-bit resolution takes ~750 ms.
+// Radio TX takes ~50-100 ms depending on payload.
+// A 500 ms interval is achievable if we keep DS18B20 reads at lower
+// resolution or alternate reads.  We use 500 ms as a compromise:
+// fast enough for accurate deployment, slow enough for all sensors.
+const unsigned long loopInterval = 500; // 500 ms between sensor reads
+
+// LED blink timing (for GPS-no-fix indication)
 bool ledBlinkOn = false;
 unsigned long previousBlinkTime = 0;
-const unsigned long blinkInterval = 500; // 500ms on / 500ms off
+const unsigned long blinkInterval = 500; // 500 ms on / 500 ms off
 
-// LED helper: common anode - LOW activates color
-void setLED(bool r, bool g, bool b) {
-  digitalWrite(LED_R, r ? LOW : HIGH);
-  digitalWrite(LED_G, g ? LOW : HIGH);
-  digitalWrite(LED_B, b ? LOW : HIGH);
+// ============================================================================
+// ALTITUDE RING-BUFFER PARAMETERS
+// ============================================================================
+// These constants control the descent/ascent detection algorithm.
+// A ring buffer of N_SAMPLES altitude readings is maintained.  Between
+// consecutive samples we compute vertical velocity.  If enough samples
+// show velocity consistent with descent (or ascent), the flag is set.
+
+static const int   ALT_RING_SIZE         = 6;    // ring-buffer capacity (>= 3)
+static const int   K_DESCENT             = 3;    // votes needed to confirm descent
+static const int   K_ASCENT              = 3;    // votes needed to confirm ascent
+static const float EXPECTED_FALL_VELOCITY = 2.0f; // m/s (positive = downward)
+static const float VEL_MARGIN            = 0.4f;  // noise margin (m/s)
+static const float MIN_DT_S              = 0.2f;  // ignore tiny dt (glitches)
+
+// Rocket ascent detection: expected upward velocity.
+// Typical hobby rockets reach 30-80 m/s; even at low thrust, > 5 m/s.
+static const float EXPECTED_ROCKET_VELOCITY = 10.0f; // m/s upward
+static const float ROCKET_VEL_MARGIN        = 3.0f;  // noise margin
+
+// Deployment altitude threshold (meters above ground level)
+static const float DEPLOY_ALTITUDE_THRESHOLD = 100.0f;
+
+// ============================================================================
+// WATCHDOG TIMER (FIX #23)
+// ============================================================================
+// The SAMD21 has a hardware Watchdog Timer (WDT).  If the main loop
+// hangs (e.g. I2C lockup, SD stall), the WDT will reset the MCU after
+// the configured timeout, restoring operation automatically.
+//
+// How it works:
+//   1. In setup(), we configure the WDT with a timeout (~4 seconds).
+//   2. Every iteration of loop(), we "pet" (reset) the WDT counter.
+//   3. If loop() ever stalls for longer than ~4 s, the WDT fires a
+//      system reset — the MCU reboots and setup() runs again.
+//   4. After reboot, the SD log file is reopened in append mode,
+//      so data continuity is preserved.
+//
+// The WDT uses the SAMD21's internal ultra-low-power 32 kHz oscillator
+// (OSCULP32K) as its clock source, independent of the main CPU clock.
+// This means it keeps ticking even if the CPU is stuck.
+
+// Helper: set up the WDT clock source and enable it
+void wdt_init(uint8_t period) {
+  // ---------- Clock setup for WDT ----------
+  // Use Generic Clock Generator 2 with the internal 32 kHz oscillator
+  // as the source for the WDT peripheral.
+
+  // Configure GCLK2 to use OSCULP32K (ultra-low-power 32 kHz)
+  GCLK->GENDIV.reg = GCLK_GENDIV_ID(2) | GCLK_GENDIV_DIV(4);
+  while (GCLK->STATUS.bit.SYNCBUSY);
+
+  GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(2)
+                     | GCLK_GENCTRL_GENEN
+                     | GCLK_GENCTRL_SRC_OSCULP32K
+                     | GCLK_GENCTRL_DIVSEL;
+  while (GCLK->STATUS.bit.SYNCBUSY);
+
+  // Route GCLK2 to the WDT peripheral
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_WDT
+                     | GCLK_CLKCTRL_CLKEN
+                     | GCLK_CLKCTRL_GEN_GCLK2;
+  while (GCLK->STATUS.bit.SYNCBUSY);
+
+  // ---------- WDT configuration ----------
+  // Disable WDT first (required before changing settings)
+  WDT->CTRL.reg = 0;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // Set the timeout period
+  WDT->CONFIG.reg = period;
+
+  // Enable the WDT
+  WDT->CTRL.reg = WDT_CTRL_ENABLE;
+  while (WDT->STATUS.bit.SYNCBUSY);
 }
+
+// Helper: "pet" the watchdog — must be called regularly to prevent reset
+void wdt_reset() {
+  WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;  // Magic value 0xA5
+  while (WDT->STATUS.bit.SYNCBUSY);
+}
+
+// ============================================================================
+// LED HELPER  (FIX #19: use const char* instead of String)
+// ============================================================================
+// Common-anode RGB LED: setting a pin LOW turns that colour ON.
+// Accepts colour names as C-strings to avoid heap-fragmenting String objects.
+
+void setLED(const char* color) {
+  // Default: all off
+  bool r = HIGH, g = HIGH, b = HIGH;
+
+  if      (strcmp(color, "red")    == 0) { r = LOW; }
+  else if (strcmp(color, "green")  == 0) { g = LOW; }
+  else if (strcmp(color, "blue")   == 0) { b = LOW; }
+  else if (strcmp(color, "yellow") == 0) { r = LOW; g = LOW; }
+  else if (strcmp(color, "purple") == 0) { r = LOW; b = LOW; }
+  else if (strcmp(color, "cyan")   == 0) { g = LOW; b = LOW; }
+  // "off" or any unrecognised string → all HIGH (LED off)
+
+  digitalWrite(LED_R, r);
+  digitalWrite(LED_G, g);
+  digitalWrite(LED_B, b);
+}
+
+// ============================================================================
+// NMEA CHECKSUM VALIDATOR (FIX #20)
+// ============================================================================
+// NMEA sentences end with *XX where XX is a two-digit hexadecimal checksum.
+// The checksum is the XOR of all characters between '$' and '*' (exclusive).
+// Returns true if the checksum is valid or if no checksum is present
+// (some truncated sentences).
+
+bool validateNMEAChecksum(const char* sentence) {
+  // Sentence must start with '$'
+  if (sentence[0] != '$') return false;
+
+  uint8_t calculated = 0;
+  int i = 1; // skip the leading '$'
+
+  // XOR every character until we hit '*' or end-of-string
+  while (sentence[i] != '\0' && sentence[i] != '*') {
+    calculated ^= (uint8_t)sentence[i];
+    i++;
+  }
+
+  // If we hit end-of-string without finding '*', skip validation
+  // (sentence was truncated — let the parser try anyway)
+  if (sentence[i] != '*') return true;
+
+  // Parse the two hex digits after '*'
+  char hexStr[3] = { sentence[i + 1], sentence[i + 2], '\0' };
+  uint8_t expected = (uint8_t)strtol(hexStr, NULL, 16);
+
+  return (calculated == expected);
+}
+
+// ============================================================================
+// MAIN CANSAT CLASS
+// ============================================================================
 
 class GreenStar {
 public:
-  double temperatureIn;
-  double temperatureOut;
-  double pressure;
-  float latitude;
-  float longitude;
-  bool descent = false;
+  // --- Sensor readings ---
+  double temperatureIn;   // BMP280 internal temperature (°C)
+  double temperatureOut;  // DS18B20 external temperature (°C)
+  double pressure;        // BMP280 atmospheric pressure (hPa)
 
+  // --- GPS data (FIX #21: use double for better precision) ---
+  double latitude;
+  double longitude;
+  double gpsAltitude;     // FIX #12: altitude from GPS GGA sentence (m MSL)
+  bool   gpsFixed;        // true when GPS has a valid position fix
+
+  // --- Flight phase flags ---
+  bool descent   = false;  // true when CanSat is descending
+  bool flight_up = false;  // true when rocket is ascending (FIX #8)
+
+  // --- Barometric altitude ---
+  // P_ground_ref: reference pressure at ground level (hPa).
+  // This should be calibrated on launch day for accurate AGL readings.
+  // For now it is set to a typical sea-level value; it will be updated
+  // before the actual mission.
   const float P_ground_ref = 1004.56f;
-  float currentHeightAG;
+  float currentHeightAG;  // computed altitude above ground (m)
 
-  static const int N_SAMPLES = 5;
-  float alt_buffer[N_SAMPLES];
-  int buf_index = 0;
+  // --- Altitude ring buffer for descent/ascent detection ---
+  // FIX #1: added t_buffer[] for timing alongside alt_buffer[]
+  // FIX #3: removed duplicate N_SAMPLES; use ALT_RING_SIZE from globals
+  float         alt_buffer[ALT_RING_SIZE];
+  unsigned long t_buffer[ALT_RING_SIZE];
+  int  buf_index   = 0;
   bool buffer_full = false;
 
 private:
+  // NMEA parsing buffer
   static const int NMEA_BUF_SIZE = 120;
   char nmeaBuf[NMEA_BUF_SIZE];
   int  nmeaLen;
 
+  // LoRa radio (CanSatKit library)
   Radio radio = Radio(Pins::Radio::ChipSelect,
                       Pins::Radio::DIO0,
                       433.0,
                       Bandwidth_125000_Hz,
                       SpreadingFactor_9,
                       CodingRate_4_8);
-
   Frame frame;
 
 public:
+  // ---- Constructor ----
   GreenStar() {
-    nmeaLen = 0;
-    latitude = 0.0f;
-    longitude = 0.0f;
-    for (int i = 0; i < N_SAMPLES; i++) {
+    nmeaLen      = 0;
+    latitude     = 0.0;
+    longitude    = 0.0;
+    gpsAltitude  = 0.0;
+    gpsFixed     = false;
+    temperatureIn  = 0.0;
+    temperatureOut = 0.0;
+    pressure       = 0.0;
+    currentHeightAG = 0.0;
+
+    // Zero-fill ring buffers
+    for (int i = 0; i < ALT_RING_SIZE; i++) {
       alt_buffer[i] = 0.0f;
+      t_buffer[i]   = 0;
     }
   }
 
+  // ------------------------------------------------------------------
+  // Sensor Initialisation
+  // ------------------------------------------------------------------
   void initializeSensors() {
-    sensors.begin();
+    dsSensors.begin();
+
+    // Set DS18B20 to 10-bit resolution (~187 ms conversion)
+    // instead of default 12-bit (~750 ms).  This allows faster reads
+    // while still providing 0.25°C resolution — sufficient for our mission.
+    dsSensors.setResolution(10);
+
     bmp.setOversampling(16);
   }
 
+  // ------------------------------------------------------------------
+  // Radio Initialisation
+  // ------------------------------------------------------------------
   void initializeRadio() {
     radio.begin();
   }
 
+  // ------------------------------------------------------------------
+  // Read DS18B20 external temperature
+  // ------------------------------------------------------------------
   void readTemperatureOut() {
-    sensors.requestTemperatures();
-    temperatureOut = sensors.getTempCByIndex(0);
+    dsSensors.requestTemperatures();
+    temperatureOut = dsSensors.getTempCByIndex(0);
   }
 
+  // ------------------------------------------------------------------
+  // Read BMP280 internal temperature and pressure
+  // ------------------------------------------------------------------
   void readTemperatureInAndPressure() {
     bmp.measureTemperatureAndPressure(temperatureIn, pressure);
   }
 
+  // ------------------------------------------------------------------
+  // Compute barometric altitude above ground level
+  // Uses the hypsometric formula:
+  //   h = 44330 × (1 − (P / P_ref)^0.1903)
+  // where P_ref is the pressure at ground level.
+  // ------------------------------------------------------------------
   void altitude_from_pressure() {
     currentHeightAG = 44330.0f * (1.0f - powf(pressure / P_ground_ref, 0.1903f));
   }
 
-  void updateAltitudeSampleAndCheckDescent() {
+  // ------------------------------------------------------------------
+  // FIX #4/#5/#8: Update altitude ring buffer & detect flight phase
+  // ------------------------------------------------------------------
+  // This function:
+  //   1. Stores the current altitude + timestamp in the ring buffer.
+  //   2. Once the buffer is full, computes velocity between consecutive
+  //      samples and counts "ascent votes" and "descent votes".
+  //   3. Sets flight_up = true if the rocket is climbing fast enough.
+  //   4. Sets descent = true if the CanSat is falling at the expected rate.
+  //
+  // ASCENT detection uses EXPECTED_ROCKET_VELOCITY: the rocket climbs
+  // much faster than the CanSat descends, so we can distinguish the two.
+  // DESCENT detection uses EXPECTED_FALL_VELOCITY: the parachute descent
+  // rate, typically ~2 m/s for CanSat missions.
+
+  void updateAltitudeSampleAndCheckPhase() {
+    unsigned long t_now = millis();
+
+    // Write new sample into ring buffer
     alt_buffer[buf_index] = currentHeightAG;
+    t_buffer[buf_index]   = t_now;
+
+    // Advance the write pointer; wrap around when full
     buf_index++;
-    if (buf_index >= N_SAMPLES) {
+    if (buf_index >= ALT_RING_SIZE) {
       buf_index = 0;
       buffer_full = true;
     }
 
-    if (buffer_full) {
-      bool all_decreasing = true;
-      int start = buf_index;
-      for (int i = 1; i < N_SAMPLES; i++) {
-        int idx_prev = (start + i - 1) % N_SAMPLES;
-        int idx_cur  = (start + i) % N_SAMPLES;
-        if (!(alt_buffer[idx_cur] < alt_buffer[idx_prev])) {
-          all_decreasing = false;
-          break;
-        }
-      }
-      descent = all_decreasing;
-    } else {
-      descent = false;
+    // Need a full buffer before we can make reliable decisions
+    if (!buffer_full) {
+      descent   = false;
+      flight_up = false;
+      return;
     }
+
+    // ---- Analyse velocity between consecutive samples ----
+    // buf_index now points to the OLDEST element (next write position).
+    int start = buf_index;
+
+    int descent_votes = 0;
+    int ascent_votes  = 0;
+
+    for (int i = 1; i < ALT_RING_SIZE; i++) {
+      int idx_prev = (start + i - 1) % ALT_RING_SIZE;
+      int idx_cur  = (start + i)     % ALT_RING_SIZE;
+
+      float dh = alt_buffer[idx_cur] - alt_buffer[idx_prev]; // metres
+      float dt = (t_buffer[idx_cur]  - t_buffer[idx_prev]) / 1000.0f; // seconds
+
+      // Skip pairs with suspiciously small time gaps (timer glitches)
+      if (dt < MIN_DT_S) continue;
+
+      float v = dh / dt; // m/s: positive = going UP, negative = going DOWN
+
+      // --- Descent vote ---
+      // v is negative when falling; check if magnitude exceeds threshold
+      if (v < -(EXPECTED_FALL_VELOCITY - VEL_MARGIN)) {
+        descent_votes++;
+      }
+
+      // --- Ascent vote (FIX #8) ---
+      // v is positive when climbing; check if magnitude exceeds rocket threshold
+      if (v > (EXPECTED_ROCKET_VELOCITY - ROCKET_VEL_MARGIN)) {
+        ascent_votes++;
+      }
+    }
+
+    descent   = (descent_votes >= K_DESCENT);
+    flight_up = (ascent_votes  >= K_ASCENT);
   }
+
+  // ------------------------------------------------------------------
+  // FIX #10/#11: GPS Reader — runs every loop() iteration
+  // ------------------------------------------------------------------
+  // Reads all available bytes from the GPS serial buffer and assembles
+  // them into complete NMEA sentences.  This must be called as often
+  // as possible to prevent the 64-byte SAMD21 serial buffer from
+  // overflowing and losing data.
+  //
+  // FIX #11: SparkFun SAM-M10Q (u-blox M10) GPS Module Notes
+  // =========================================================
+  // The SAM-M10Q is a multi-GNSS receiver that concurrently tracks
+  // GPS, GLONASS, Galileo, and BeiDou.  According to the u-blox M10
+  // interface description (UBX-20053845):
+  //
+  //   - Default main Talker ID is "GN" (multi-GNSS).
+  //   - Sentences: $GNGGA, $GNRMC, $GNGLL, $GNVTG, $GNGSA, etc.
+  //   - However, u-blox also supports $GPGGA if the talker ID is changed
+  //     via setMainTalkerID(), or if only GPS constellation is enabled.
+  //   - GSV messages use constellation-specific IDs: $GPGSV, $GLGSV, etc.
+  //
+  // To be robust against configuration changes, we match the sentence
+  // TYPE (GGA, RMC) regardless of the two-letter talker prefix.
+  // This handles $GNGGA, $GPGGA, $GLGGA, $GBGGA, $GAGGA, etc.
+  //
+  // The module's default UART baud rate is 9600 at 1 Hz update.
+  // At 9600 baud, ~960 bytes/s can be received.  A full NMEA cycle
+  // (GGA+RMC+GSA+GSV etc.) is typically 400-600 bytes, so 1 Hz is fine.
 
   void readGPS() {
     while (GPS_SERIAL.available()) {
       char c = GPS_SERIAL.read();
+
       if (c == '\n') {
+        // End of sentence — null-terminate and process
         nmeaBuf[nmeaLen] = '\0';
-        processNMEALine(nmeaBuf);
+
+        // FIX #20: Only parse sentences with valid checksum
+        if (validateNMEAChecksum(nmeaBuf)) {
+          processNMEALine(nmeaBuf);
+        }
+
         nmeaLen = 0;
       }
       else if (c != '\r') {
+        // Accumulate characters (skip carriage returns)
         if (nmeaLen < NMEA_BUF_SIZE - 1) {
           nmeaBuf[nmeaLen++] = c;
         } else {
+          // Buffer overflow — discard this sentence
           nmeaLen = 0;
         }
       }
     }
   }
 
+  // ------------------------------------------------------------------
+  // FIX #9: Log data to SD card
+  // Now includes all fields: flight_up, servoDone, servoMoving, openContainer
+  // ------------------------------------------------------------------
   void logData() {
     if (!logFile) return;
 
     unsigned long ms = millis();
 
-    logFile.print(ms);                logFile.print(',');
-    logFile.print(temperatureIn, 2);  logFile.print(',');
-    logFile.print(temperatureOut, 2); logFile.print(',');
-    logFile.print(pressure, 2);       logFile.print(',');
-    logFile.print(latitude, 6);       logFile.print(',');
-    logFile.print(longitude, 6);      logFile.print(',');
-    logFile.print(currentHeightAG, 3); logFile.print(',');
-    logFile.println(descent);
+    // CSV format: timestamp,tempIn,tempOut,pressure,lat,lon,altAGL,gpsAlt,
+    //             descent,flight_up,servoDone,servoMoving,openContainer
+    logFile.print(ms);                  logFile.print(',');
+    logFile.print(temperatureIn, 2);    logFile.print(',');
+    logFile.print(temperatureOut, 2);   logFile.print(',');
+    logFile.print(pressure, 2);         logFile.print(',');
+    logFile.print(latitude, 6);         logFile.print(',');
+    logFile.print(longitude, 6);        logFile.print(',');
+    logFile.print(currentHeightAG, 3);  logFile.print(',');
+    logFile.print(gpsAltitude, 2);      logFile.print(',');
+    logFile.print(descent ? 1 : 0);     logFile.print(',');
+    logFile.print(flight_up ? 1 : 0);   logFile.print(',');
+    logFile.print(servoDone ? 1 : 0);   logFile.print(',');
+    logFile.print(servoMoving ? 1 : 0); logFile.print(',');
+    logFile.println(openContainer ? 1 : 0);
 
     logFile.flush();
 
-    SerialUSB.print("Temperature out: ");
-    SerialUSB.print(temperatureOut);
-    SerialUSB.println(" °C");
+    // --- Debug output to SerialUSB (visible via USB cable) ---
+    SerialUSB.print("T_out: ");   SerialUSB.print(temperatureOut);
+    SerialUSB.print(" | P: ");    SerialUSB.print(pressure);
+    SerialUSB.print(" | T_in: "); SerialUSB.print(temperatureIn);
+    SerialUSB.print(" | Lat: ");  SerialUSB.print(latitude, 6);
+    SerialUSB.print(" | Lon: ");  SerialUSB.print(longitude, 6);
+    SerialUSB.print(" | hAGL: "); SerialUSB.print(currentHeightAG, 2);
+    SerialUSB.print(" | GPS_alt: "); SerialUSB.print(gpsAltitude, 2);
+    SerialUSB.print(" | desc: "); SerialUSB.print(descent ? "Y" : "N");
+    SerialUSB.print(" | up: ");   SerialUSB.print(flight_up ? "Y" : "N");
+    SerialUSB.print(" | servo: ");
+    SerialUSB.println(servoDone ? "DONE" : (servoMoving ? "MOVING" : "WAIT"));
 
-    SerialUSB.print("Pressure: ");
-    SerialUSB.print(pressure);
-    SerialUSB.println(" hPa");
-
-    SerialUSB.print("Temperature in: ");
-    SerialUSB.print(temperatureIn);
-    SerialUSB.println(" °C");
-
-    SerialUSB.print("Lat: ");
-    SerialUSB.println(latitude, 6);
-    SerialUSB.print("Lon: ");
-    SerialUSB.println(longitude, 6);
-
-    SerialUSB.print("Height AGL: ");
-    SerialUSB.println(currentHeightAG, 6);
-
-    SerialUSB.print("Descent: ");
-    SerialUSB.println(descent ? "YES" : "NO");
-
-    for (int i = 0; i < N_SAMPLES; i++) {
-      SerialUSB.print(alt_buffer[i], 3);
+    // Print altitude ring buffer for debugging
+    SerialUSB.print("  alt_buf: ");
+    for (int i = 0; i < ALT_RING_SIZE; i++) {
+      SerialUSB.print(alt_buffer[i], 2);
       SerialUSB.print(" ");
     }
-    SerialUSB.println("");
-
-    SerialUSB.println("Logged data to SD");
+    SerialUSB.println();
   }
 
+  // ------------------------------------------------------------------
+  // FIX #7/#2: Send telemetry via LoRa radio
+  // Added comma separators between ALL fields and fixed missing semicolon.
+  // ------------------------------------------------------------------
   void sendRadioBundle() {
     unsigned long ms = millis();
 
-    frame.print(ms);                frame.print(',');
-    frame.print(temperatureIn, 2);  frame.print(',');
-    frame.print(temperatureOut, 2); frame.print(',');
-    frame.print(pressure, 2);       frame.print(',');
-    frame.print(latitude, 6);       frame.print(',');
-    frame.print(longitude, 6);      frame.print(',');
-    frame.print(currentHeightAG, 3); frame.print(',');
-    frame.print(descent ? 1 : 0);
+    frame.print(ms);                  frame.print(',');
+    frame.print(temperatureIn, 2);    frame.print(',');
+    frame.print(temperatureOut, 2);   frame.print(',');
+    frame.print(pressure, 2);         frame.print(',');
+    frame.print(latitude, 6);         frame.print(',');
+    frame.print(longitude, 6);        frame.print(',');
+    frame.print(currentHeightAG, 3);  frame.print(',');
+    frame.print(gpsAltitude, 2);      frame.print(',');
+    frame.print(descent ? 1 : 0);     frame.print(',');  // FIX #7: comma added
+    frame.print(flight_up ? 1 : 0);   frame.print(',');  // FIX #7: comma added
+    frame.print(servoDone ? 1 : 0);   frame.print(',');  // FIX #7: comma added
+    frame.print(servoMoving ? 1 : 0); frame.print(',');  // FIX #7: comma added
+    frame.print(openContainer ? 1 : 0);                  // FIX #2: semicolon added
 
     radio.transmit(frame);
 
@@ -229,179 +583,419 @@ public:
   }
 
 private:
-  void processNMEALine(const char *line) {
-    if (!(strncmp(line, "$GNGGA", 6) == 0 ||
-          strncmp(line, "$GNRMC", 6) == 0)) {
-      return;
-    }
+  // ------------------------------------------------------------------
+  // FIX #11: NMEA sentence processor — handles any talker ID
+  // ------------------------------------------------------------------
+  // Instead of checking for exact prefixes like "$GNGGA", we now look
+  // at the 3rd-5th characters of the sentence to match the sentence
+  // TYPE: "GGA" or "RMC".  This handles all possible talker IDs:
+  //   $GNGGA, $GPGGA, $GLGGA, $GBGGA, $GAGGA  (GGA variants)
+  //   $GNRMC, $GPRMC, $GLRMC                   (RMC variants)
+  //
+  // NMEA sentence format reference:
+  //   Position 0:   '$'
+  //   Position 1-2: Talker ID  (GP, GN, GL, GA, GB, etc.)
+  //   Position 3-5: Sentence type (GGA, RMC, GSA, GSV, etc.)
+  //
+  // GGA sentence structure (fields separated by commas):
+  //   $--GGA,hhmmss.ss,llll.lll,a,yyyyy.yyy,a,x,xx,x.x,x.x,M,x.x,M,,*hh
+  //   Field 0:  Sentence ID ($GNGGA)
+  //   Field 1:  UTC time (hhmmss.ss)
+  //   Field 2:  Latitude (ddmm.mmmm)
+  //   Field 3:  N/S indicator
+  //   Field 4:  Longitude (dddmm.mmmm)
+  //   Field 5:  E/W indicator
+  //   Field 6:  Fix quality (0=invalid, 1=GPS, 2=DGPS, ...)
+  //   Field 7:  Number of satellites
+  //   Field 8:  HDOP
+  //   Field 9:  Altitude above MSL (metres)  ← FIX #12: now extracted
+  //   Field 10: Altitude units (M)
+  //   Field 11: Geoid separation
+  //   ...
+  //
+  // RMC sentence structure:
+  //   $--RMC,hhmmss.ss,A,llll.lll,a,yyyyy.yyy,a,x.x,x.x,ddmmyy,x.x,a*hh
+  //   Field 2: Latitude
+  //   Field 3: N/S
+  //   Field 4: Longitude
+  //   Field 5: E/W
 
+  void processNMEALine(const char* line) {
+    // Minimum valid sentence: "$XXYYY,..." = at least 7 chars
+    int lineLen = strlen(line);
+    if (lineLen < 7) return;
+
+    // Must start with '$'
+    if (line[0] != '$') return;
+
+    // Extract sentence type from positions 3-5
+    char type[4];
+    type[0] = line[3];
+    type[1] = line[4];
+    type[2] = line[5];
+    type[3] = '\0';
+
+    bool isGGA = (strcmp(type, "GGA") == 0);
+    bool isRMC = (strcmp(type, "RMC") == 0);
+
+    if (!isGGA && !isRMC) return; // not a sentence we care about
+
+    // --- Split the sentence into comma-separated fields ---
     char buf[NMEA_BUF_SIZE];
     strncpy(buf, line, NMEA_BUF_SIZE);
     buf[NMEA_BUF_SIZE - 1] = '\0';
 
-    char *fields[20];
-    int idx = 0;
-    char *p = buf;
-    fields[idx++] = p;
-    while (*p && idx < 20) {
+    char* fields[20];
+    int fieldCount = 0;
+    char* p = buf;
+    fields[fieldCount++] = p;
+    while (*p && fieldCount < 20) {
       if (*p == ',') {
         *p = '\0';
-        fields[idx++] = p + 1;
+        fields[fieldCount++] = p + 1;
       }
       p++;
     }
 
-    if (idx > 6 && strlen(fields[3]) >= 4 && strlen(fields[5]) >= 4) {
-      float lat = convertNMEADeg(fields[3]);
-      float lon = convertNMEADeg(fields[5]);
-      if (fields[4][0] == 'S') lat = -lat;
-      if (fields[6][0] == 'W') lon = -lon;
-      latitude = lat;
-      longitude = lon;
+    // --- Parse GGA sentence ---
+    if (isGGA) {
+      // Need at least 10 fields to extract lat/lon and altitude
+      // Fields: 0=type, 1=time, 2=lat, 3=N/S, 4=lon, 5=E/W,
+      //         6=quality, 7=numSats, 8=HDOP, 9=altitude, 10=altUnit
+      if (fieldCount > 10 && strlen(fields[2]) >= 4 && strlen(fields[4]) >= 4) {
+
+        // Check fix quality (field 6): 0 = no fix
+        int fixQuality = atoi(fields[6]);
+        if (fixQuality == 0) {
+          gpsFixed = false;
+          return;
+        }
+
+        // Parse latitude: format is ddmm.mmmm
+        double lat = convertNMEADeg(fields[2]);
+        if (fields[3][0] == 'S') lat = -lat;
+
+        // Parse longitude: format is dddmm.mmmm
+        double lon = convertNMEADeg(fields[4]);
+        if (fields[5][0] == 'W') lon = -lon;
+
+        latitude  = lat;
+        longitude = lon;
+        gpsFixed  = true;
+
+        // FIX #12: Extract GPS altitude (field 9) — metres above MSL
+        if (strlen(fields[9]) > 0) {
+          gpsAltitude = atof(fields[9]);
+        }
+      }
+    }
+
+    // --- Parse RMC sentence ---
+    else if (isRMC) {
+      // RMC fields: 0=type, 1=time, 2=status, 3=lat, 4=N/S, 5=lon, 6=E/W
+      // Status (field 2): 'A' = active/valid, 'V' = void/invalid
+      if (fieldCount > 6 && strlen(fields[3]) >= 4 && strlen(fields[5]) >= 4) {
+
+        // Check status
+        if (fields[2][0] != 'A') {
+          // Data is void — don't update position
+          return;
+        }
+
+        double lat = convertNMEADeg(fields[3]);
+        if (fields[4][0] == 'S') lat = -lat;
+
+        double lon = convertNMEADeg(fields[5]);
+        if (fields[6][0] == 'W') lon = -lon;
+
+        latitude  = lat;
+        longitude = lon;
+        gpsFixed  = true;
+      }
     }
   }
 
-  float convertNMEADeg(const char *raw) {
-    float v = atof(raw);
-    int deg = (int)(v / 100);
-    float minutes = v - (deg * 100);
-    return deg + (minutes / 60.0);
+  // ------------------------------------------------------------------
+  // FIX #21: NMEA coordinate conversion — uses double for precision
+  // ------------------------------------------------------------------
+  // NMEA format:  ddmm.mmmm (lat) or dddmm.mmmm (lon)
+  // Converts to decimal degrees:  dd.dddddd
+  //
+  // Using double (~15 significant digits) instead of float (~7 digits)
+  // avoids precision loss.  For longitude like 02101.1234, float would
+  // only give ~5 decimal-degree digits; double gives the full ~10.
+
+  double convertNMEADeg(const char* raw) {
+    double v = atof(raw);           // e.g. 5213.1234 → 5213.1234
+    int deg = (int)(v / 100);       // e.g. 52
+    double minutes = v - (deg * 100); // e.g. 13.1234
+    return deg + (minutes / 60.0);  // e.g. 52.218723...
   }
 };
 
+// ============================================================================
+// GLOBAL CANSAT INSTANCE
+// ============================================================================
 GreenStar cansat;
 
+// ============================================================================
+// SETUP
+// ============================================================================
 void setup() {
-  // Initialize LED pins
+  // ---- Initialise LED pins ----
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
-  setLED(false, false, false);
+  setLED("off");
 
-  SerialUSB.begin(9600);
-  GPS_SERIAL.begin(9600);
+  // ---- Start serial interfaces ----
+  SerialUSB.begin(115200);   // USB debug output (fast baud for debug)
+  GPS_SERIAL.begin(9600);    // GPS module UART (9600 is M10Q default)
 
-  // Initialize servo to starting position (0 degrees)
+  // ---- Attach servo to its pin and set to closed position (0°) ----
+  // The servo is attached once here and stays attached throughout the
+  // flight, so it is ready to respond immediately when deployment
+  // conditions are met.  We do NOT detach it.
   containerServo.attach(SERVO_PIN);
   containerServo.write(0);
-  delay(500);
+  delay(500); // allow servo to reach position
 
-  // RED (2s) - Arduino is powered
-  setLED(true, false, false);
+  // === LED STARTUP SEQUENCE ===
+  // Each colour indicates a subsystem status during boot.
+  // If any critical subsystem fails, the LED blinks red indefinitely
+  // (with alternating off, so it's visible as a blink — FIX #18).
+
+  // GREEN (2s) — Arduino is powered and running
+  // FIX #17: comment now matches the actual colour
+  setLED("green");
   delay(2000);
-  setLED(false, false, false);
+  setLED("off");
 
+  // ---- SD card initialisation ----
   pinMode(chipSelect, OUTPUT);
   if (!SD.begin(chipSelect)) {
     SerialUSB.println("SD init failed, stopping.");
-    while (1);
+    // FIX #18: blink red (toggle on/off) to signal SD failure
+    while (1) {
+      setLED("red");
+      delay(500);
+      setLED("off");
+      delay(500);
+    }
   }
 
+  // Open log file in append mode (preserves data across WDT resets)
   logFile = SD.open("log.csv", FILE_WRITE);
   if (!logFile) {
     SerialUSB.println("Failed to open log.csv for writing.");
-    while (1);
+    while (1) {
+      setLED("red");
+      delay(500);
+      setLED("off");
+      delay(500);
+    }
   }
 
+  // Write CSV header if the file is new (empty)
+  // FIX #9: header now matches all logged fields
   if (logFile.size() == 0) {
-    logFile.println("timestamp_ms,temperatureIn,temperatureOut,pressure,latitude,longitude,altitude_AGL,descent");
+    logFile.println(
+      "timestamp_ms,temperatureIn,temperatureOut,pressure,"
+      "latitude,longitude,altitude_AGL,gps_altitude,"
+      "descent,flight_up,servoDone,servoMoving,openContainer"
+    );
     logFile.flush();
   }
 
+  // ---- BMP280 initialisation ----
   if (!bmp.begin()) {
     SerialUSB.println("BMP init failed!");
-    while (1);
+    while (1) {
+      setLED("red");
+      delay(500);
+      setLED("off");
+      delay(500);
+    }
   }
 
+  // ---- Sensor initialisation ----
   cansat.initializeSensors();
 
-  // YELLOW (2s) - pressure and temperature sensors working properly
+  // YELLOW (2s) — pressure & temperature sensors working
+  // Do a test read and check values are within sane ranges
   cansat.readTemperatureInAndPressure();
   bool sensorsOk = (cansat.pressure >= 300.0 && cansat.pressure <= 1100.0) &&
-                   (cansat.temperatureIn >= -40.0 && cansat.temperatureIn <= 85.0);
+                   (cansat.temperatureIn > -40.0 && cansat.temperatureIn <= 85.0);
   if (sensorsOk) {
-    setLED(true, true, false);
+    setLED("yellow");
     delay(2000);
-    setLED(false, false, false);
+    setLED("off");
+  } else {
+    // Sensor values out of range — flash yellow then red to warn
+    setLED("yellow");
+    delay(500);
+    for (int i = 0; i < 5; i++) {
+      setLED("red");
+      delay(300);
+      setLED("off");
+      delay(200);
+    }
   }
 
+  // ---- Radio initialisation ----
   cansat.initializeRadio();
 
-  // BLUE (2s) - radio initialized and working
-  setLED(false, false, true);
+  // BLUE (2s) — radio is initialised
+  setLED("blue");
   delay(2000);
-  setLED(false, false, false);
+  setLED("off");
 
-  SerialUSB.println("Setup done, logging started.");
+  SerialUSB.println("=== Setup complete, logging started ===");
 
-  previousLoopTime = millis();
+  // Record starting timestamps for non-blocking timing
+  previousLoopTime  = millis();
   previousBlinkTime = millis();
+
+  // ---- FIX #23: Enable Watchdog Timer ----
+  // Configure WDT with ~4 second timeout.
+  // WDT_CONFIG_PER_4K = 4096 clock cycles ≈ 4 seconds at ~1 kHz
+  // (after GCLK2 divider).
+  // If the main loop stalls for more than ~4 s, the MCU resets.
+  wdt_init(WDT_CONFIG_PER_4K);
+  SerialUSB.println("WDT enabled (~4 s timeout)");
 }
 
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
 void loop() {
   unsigned long now = millis();
 
-  // ===================== SENSOR READ EVERY 1s =====================
+  // ---- FIX #23: Pet the watchdog every iteration ----
+  // This must happen frequently (at least every ~4 s) to prevent reset.
+  wdt_reset();
+
+  // ================================================================
+  // FIX #10: Read GPS EVERY iteration — not just once per second.
+  // The SAMD21 hardware serial buffer is only 64 bytes.  At 9600 baud
+  // the GPS sends ~960 bytes/s, so the buffer fills in ~67 ms.
+  // By calling readGPS() every loop iteration (which runs much faster
+  // than once per second), we drain the buffer before it overflows.
+  // ================================================================
+  cansat.readGPS();
+
+  // ================================================================
+  // SENSOR READ — every loopInterval (500 ms)
+  // ================================================================
   if (now - previousLoopTime >= loopInterval) {
     previousLoopTime = now;
 
+    // Read all sensors
     cansat.readTemperatureOut();
     cansat.readTemperatureInAndPressure();
+
+    // Compute barometric altitude from pressure
     cansat.altitude_from_pressure();
-    cansat.updateAltitudeSampleAndCheckDescent();
-    cansat.readGPS();
+
+    // Update the altitude ring buffer and check flight phase
+    // (sets cansat.descent and cansat.flight_up)
+    cansat.updateAltitudeSampleAndCheckPhase();
+
+    // Log to SD card and transmit via radio
     cansat.logData();
     cansat.sendRadioBundle();
   }
-  // ================================================================
 
-  // ===================== TEST MODE =====================
+  // ================================================================
+  // TEST MODE — servo triggers 10 s after boot (for ground testing)
+  // ================================================================
   if (test && !openContainer && now >= 10000) {
     openContainer = true;
-    SerialUSB.println("TEST: triggering servo opening after 10s");
+    SerialUSB.println("TEST: triggering servo after 10 s");
   }
-  // =====================================================
 
-  // ===================== NON-BLOCKING SERVO SWEEP =====================
+  // ================================================================
+  // FIX #4/#5: FLIGHT DEPLOYMENT LOGIC
+  // ================================================================
+  // Deployment conditions (ALL must be true simultaneously):
+  //   1. flight_up was detected at some point (rocket ascended)
+  //   2. descent is currently true (CanSat is falling)
+  //   3. currentHeightAG <= 100 m (at or below deployment altitude)
+  //   4. Servo hasn't already started or finished
+  //
+  // This prevents accidental deployment:
+  //   - On the ground before launch (no flight_up history)
+  //   - During ascent (descent is false)
+  //   - At high altitude (altitude check)
+  //   - After deployment (servoDone/openContainer guards)
+  //
+  // We use a static flag 'rocketFlew' to latch the flight_up event.
+  // Once the rocket has been detected ascending, this stays true
+  // even after apogee when flight_up becomes false again.
+
+  static bool rocketFlew = false;
+  if (cansat.flight_up) {
+    rocketFlew = true;
+  }
+
+  if (!test &&  // only in real flight mode
+      !openContainer &&
+      !servoDone &&
+      rocketFlew &&
+      cansat.descent &&
+      cansat.currentHeightAG <= DEPLOY_ALTITUDE_THRESHOLD) {
+    openContainer = true;
+    SerialUSB.println("DEPLOY: conditions met — opening container!");
+  }
+
+  // ================================================================
+  // NON-BLOCKING SERVO SWEEP
+  // ================================================================
+  // When openContainer becomes true, the servo sweeps from 0° to 180°
+  // over servoSweepDuration milliseconds.  This is non-blocking: the
+  // loop continues running, sensors keep reading, radio keeps sending.
+
   if (openContainer && !servoDone) {
     if (!servoMoving) {
+      // Start the sweep
       servoMoving = true;
       servoStartTime = now;
+      SerialUSB.println("Servo: starting sweep 0° → 180°");
     }
 
     unsigned long elapsed = now - servoStartTime;
 
     if (elapsed >= (unsigned long)servoSweepDuration) {
+      // Sweep complete — hold at final position
       containerServo.write(180);
-      delay(300); // brief hold to ensure servo reaches final position
-      containerServo.detach(); // release timer to restore LED PWM
       servoMoving = false;
       servoDone = true;
-      SerialUSB.println("Servo: reached 180°, detached");
+      // NOTE: Servo stays attached.  We do not detach because:
+      //   a) We want to hold the plate open under parachute vibration.
+      //   b) Detach was causing LED PWM timer conflicts.
+      SerialUSB.println("Servo: sweep complete (180°)");
     } else {
+      // Proportional sweep: linearly map elapsed time to angle
       int angle = (int)((float)elapsed / (float)servoSweepDuration * 180.0f);
       containerServo.write(angle);
     }
   }
-  // ====================================================================
 
-  // ===================== NON-BLOCKING LED GPS STATUS =====================
-  bool gpsFixed = !(cansat.latitude == 0.0f && cansat.longitude == 0.0f);
+  // ================================================================
+  // NON-BLOCKING LED — GPS STATUS INDICATOR
+  // ================================================================
+  // Cyan blinking = waiting for GPS fix
+  // Cyan solid    = GPS fix acquired, all systems nominal
 
-  if (!gpsFixed) {
-    // PURPLE blinking — toggle every 500ms
+  if (!cansat.gpsFixed) {
+    // Blink cyan: toggle every 500 ms
     if (now - previousBlinkTime >= blinkInterval) {
       previousBlinkTime = now;
       ledBlinkOn = !ledBlinkOn;
     }
-    if (ledBlinkOn) {
-      setLED(true, false, true); // PURPLE = R+B
-    } else {
-      setLED(false, false, false);
-    }
+    setLED(ledBlinkOn ? "cyan" : "off");
   } else {
-    // GREEN constant — all systems working
-    setLED(false, true, false);
+    // Solid cyan — GPS has fix
+    setLED("cyan");
   }
-  // ======================================================================
 }
